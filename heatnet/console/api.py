@@ -63,6 +63,9 @@ class Api:
         add("POST", "/api/startup", self._startup)
         add("POST", "/api/shutdown", self._shutdown)
         add("POST", "/api/dispatch", self._dispatch)
+        add("GET", "/api/dispatch/progress", self._dispatch_progress)
+        add("POST", "/api/dispatch/resume", self._dispatch_resume)
+        add("POST", "/api/dispatch/abort", self._dispatch_abort)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/retrofit", self._retrofit)
@@ -282,6 +285,25 @@ class Api:
             selected,
             cancel,
         )
+
+    def _dispatch_progress(self, params: dict, body: dict) -> dict:
+        batch_id = params.get("batch_id") or body.get("batch_id") or None
+        return self._platform.dispatch_progress(None if batch_id is None else str(batch_id))
+
+    def _dispatch_resume(self, params: dict, body: dict) -> dict:
+        batch_id = body.get("batch_id")
+        cancel = CancelToken(str(body.get("cancel_reason", "console-cancel"))) if body.get("cancel") else None
+        return self._platform.resume_dispatch(
+            None if batch_id is None else str(batch_id),
+            cancel,
+            _as_float(body, "dt", 1.0),
+        )
+
+    def _dispatch_abort(self, params: dict, body: dict) -> dict:
+        batch_id = str(body.get("batch_id", ""))
+        if not batch_id:
+            raise ValueError("缺少必填字段 batch_id")
+        return self._platform.abort_dispatch(batch_id)
 
     def _cycle(self, params: dict, body: dict) -> dict:
         return self._platform.cycle(_as_float(body, "dt", 1.0))

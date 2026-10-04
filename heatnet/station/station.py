@@ -69,7 +69,12 @@ class HeatStation:
     def demand_pct(self) -> float:
         """按目标温差给出混水阀需求开度。"""
 
-        gap = self._target_c - self._supply_c
+        return self.demand_for(self._target_c)
+
+    def demand_for(self, target_c: float) -> float:
+        """按给定目标温度折算混水阀需求开度（只计算，不改本站状态）。"""
+
+        gap = float(target_c) - self._supply_c
         return max(0.0, min(100.0, 50.0 + gap * 12.0))
 
     def settle(self, dt: float) -> float:

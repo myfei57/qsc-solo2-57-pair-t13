@@ -18,11 +18,16 @@ def apply_mix(
     durable: DurableState,
     target_c: float,
     dt: float = 1.0,
+    demand_pct: float | None = None,
 ) -> dict:
-    """按目标温度调整混水阀并推进站内温度。"""
+    """按目标温度调整混水阀并推进站内温度。
+
+    ``demand_pct`` 缺省时按当前温差现算；批次执行时传入建批时快照的计划开度，
+    保证同一批次的每一步都按步骤表里的开度下发，续作不会因现场温度变化而改口。
+    """
 
     station.set_target(target_c)
-    demand = station.demand_pct()
+    demand = station.demand_pct() if demand_pct is None else max(0.0, min(100.0, float(demand_pct)))
     move = move_valve(valve, durable, demand)
     for _ in range(600):
         valve.step(dt)

@@ -15,7 +15,7 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import InterlockError, PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
@@ -38,7 +38,9 @@ from .source.adjust import Adjustment, apply_adjustment
 from .source.source import HeatSource
 from .source.weather import WeatherPush, push_weather
 from .station.batch import build_plan
+from .station.journal import BATCH_DISPATCHING, BATCH_INTERRUPTED, BatchJournal
 from .station.mapping import StationMapping
+from .station.resume import BatchRunner
 from .station.service import CancelToken, StationService
 from .station.station import HeatStation
 from .store.command import CommandCheckpoint
@@ -86,6 +88,7 @@ class Platform:
         self.metrics = StoreMetrics(store.root)
         self.durable = DurableState(store)
         self.checkpoint = CommandCheckpoint(store)
+        self.batch_journal = BatchJournal(store)
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
@@ -193,6 +196,30 @@ class Platform:
             for command in self.queues[name].commands():
                 if command.seq <= applied:
                     continue
+        self._restore_batches()
+        self._restore_trips()
+
+    def _restore_batches(self) -> None:
+        """把重启前停在下发中途的批次标成掉线（部分失败），等待核对后续作。"""
+
+        for batch in self.batch_journal.open_batches():
+            if batch["status"] != BATCH_DISPATCHING:
+                continue
+            self.batch_journal.set_status(batch, BATCH_INTERRUPTED)
+            self.bus.publish(
+                Event.of(
+                    "dispatch",
+                    "dispatch",
+                    "dispatch_interrupted",
+                    severity="warning",
+                    message=f"批次 {batch['batch_id']} 掉线中断，按部分失败处理，续作前须核对现场",
+                    batch_id=batch["batch_id"],
+                )
+            )
+
+    def _restore_trips(self) -> None:
+        """从审计流水回放停机保护，重启后仍保持停机态。"""
+
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
@@ -383,7 +410,7 @@ class Platform:
         zones: list[str] | None = None,
         cancel: CancelToken | None = None,
     ) -> dict:
-        """按分区下发一次调度。"""
+        """按分区下发一次调度（建批并按日志逐站执行）。"""
 
         with self._lock:
             selected = list(zones) if zones else self.zones.names()
@@ -398,11 +425,58 @@ class Platform:
                 demand_pct,
                 setpoint,
                 cancel,
+                journal=self.batch_journal,
+                bus=self.bus,
+                ts=self.clock.now(),
             )
             summary = self._record_operation(op_id, "dispatch", report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _batch_runner(self) -> BatchRunner:
+        """按当前装配构造批次执行器。"""
+
+        return BatchRunner(
+            self.service, self.mapping, self.zones, self.network, self.batch_journal, self.bus
+        )
+
+    def resume_dispatch(
+        self,
+        batch_id: str | None = None,
+        cancel: CancelToken | None = None,
+        dt: float = 1.0,
+    ) -> dict:
+        """续作一个未完成批次：世代加一、先核对现场、再按序补发未完成的站。"""
+
+        with self._lock:
+            runner = self._batch_runner()
+            target = batch_id or runner.latest_open_batch_id()
+            if target is None:
+                raise InterlockError("没有可续作的批次", component="dispatch")
+            op_id = self.ids.next()
+            report = runner.resume(target, cancel=cancel, dt=dt, ts=self.clock.now())
+            summary = self._record_operation(op_id, "dispatch_resume", report)
+            self._operations += 1
+            self._persist()
+            return {**report, **summary}
+
+    def abort_dispatch(self, batch_id: str) -> dict:
+        """作废一个未完成批次：已确认的站保持现状，未发的站放弃并释放占用。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            report = self._batch_runner().abort(batch_id, ts=self.clock.now())
+            summary = self._record_operation(op_id, "dispatch_abort", report)
+            self._operations += 1
+            self._persist()
+            return {**report, **summary}
+
+    def dispatch_progress(self, batch_id: str | None = None) -> dict:
+        """返回批次续作进度（从落盘日志派生），供控制台展示。"""
+
+        with self._lock:
+            return self._batch_runner().progress(batch_id)
 
     def calibrate_flow(self, measured_t_h: float) -> dict:
         """按实测流量重新标定一次网基线。"""
@@ -812,6 +886,10 @@ class Platform:
             },
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "dispatch": {
+                "open": self.dispatch_progress()["open"],
+                "recent": self.dispatch_progress()["batches"][-5:],
+            },
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),

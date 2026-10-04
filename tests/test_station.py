@@ -60,12 +60,13 @@ def test_batch_flows_are_independent_per_station():
     assert network.dispatches() == 0
 
 
-def test_adjust_zone_applies_to_every_station(tmp_path):
-    zones, mapping, service, _ = _stack(tmp_path)
-    report = service.adjust_zone(mapping, "north", 61.0)
+def test_run_batch_applies_to_every_station(tmp_path):
+    zones, mapping, service, network = _stack(tmp_path)
+    report = run_batch(service, mapping, zones, network, ["north"], 60.0, 61.0)
     assert report["ok"] is True
     assert report["adjusted"] == ["st01", "st02", "st03"]
-    assert report["skipped"] == []
+    assert report["remaining"] == []
+    assert report["batch_status"] == "completed"
     for name in ("st01", "st02", "st03"):
         assert service.get(name).target_c() == pytest.approx(61.0)
         assert service.valve(name).position_pct() > 0.0
@@ -74,28 +75,29 @@ def test_adjust_zone_applies_to_every_station(tmp_path):
 
 
 def test_cancelled_before_start_changes_nothing(tmp_path):
-    zones, mapping, service, _ = _stack(tmp_path)
+    zones, mapping, service, network = _stack(tmp_path)
     token = CancelToken("client-timeout")
     token.cancel()
-    report = service.adjust_zone(mapping, "north", 61.0, token)
+    report = run_batch(service, mapping, zones, network, ["north"], 60.0, 61.0, token)
     assert report["ok"] is False
     assert report["adjusted"] == []
-    assert report["skipped"] == ["st01", "st02", "st03"]
+    assert report["remaining"] == ["st01", "st02", "st03"]
     assert report["violations"] == ["cancelled:client-timeout"]
+    assert report["batch_status"] == "cancelled"
     assert service.valve("st01").moves() == 0
     assert service.aborted() == 1
 
 
 def test_cancellation_is_checked_at_every_station(tmp_path):
-    zones, mapping, service, _ = _stack(tmp_path)
-    report = service.adjust_zone(mapping, "north", 61.0, _CancelAfter(1))
+    zones, mapping, service, network = _stack(tmp_path)
+    report = run_batch(service, mapping, zones, network, ["north"], 60.0, 61.0, _CancelAfter(1))
     assert report["ok"] is False
     assert report["adjusted"] == ["st01"]
-    assert report["skipped"] == ["st02", "st03"]
+    assert report["remaining"] == ["st02", "st03"]
     assert service.get("st02").target_c() == pytest.approx(service.get("st02").limits.setpoint_c)
     assert service.valve("st02").moves() == 0
     with pytest.raises(ValueError):
-        service.adjust_zone(mapping, "north", 61.0, None, 0.0)
+        run_batch(service, mapping, zones, network, ["north"], 60.0, 61.0, None, 0.0)
 
 
 def test_run_batch_reports_flows_and_adjustments(tmp_path):

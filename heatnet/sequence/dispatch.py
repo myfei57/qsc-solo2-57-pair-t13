@@ -1,14 +1,17 @@
 """调度下发编排。
 
 调度把目标负荷折算成各站的开度需求，按分区优先级排出计划，交给一次网按站独立
-分配流量，再逐区下发。流量基线可以按实测重新标定，标定之后联锁门限同步变化。
+分配流量，再按批次日志逐站下发：每一步先落日志再动阀，取消或掉线后按日志续作。
+流量基线可以按实测重新标定，标定之后联锁门限同步变化。
 """
 
 from __future__ import annotations
 
+from ..eventbus import EventBus
 from ..ns.zone import ZoneRegistry
 from ..primary.network import PrimaryNetwork
 from ..station.batch import run_batch
+from ..station.journal import BatchJournal
 from ..station.mapping import StationMapping
 from ..station.service import CancelToken, StationService
 
@@ -23,11 +26,25 @@ def dispatch_demand(
     target_c: float,
     cancel: CancelToken | None = None,
     dt: float = 1.0,
+    journal: BatchJournal | None = None,
+    bus: EventBus | None = None,
+    ts: float = 0.0,
 ) -> dict:
     """按分区下发一次调度。"""
 
     report = run_batch(
-        service, mapping, zones, network, zone_names, demand_pct, target_c, cancel, dt
+        service,
+        mapping,
+        zones,
+        network,
+        zone_names,
+        demand_pct,
+        target_c,
+        cancel,
+        dt,
+        journal=journal,
+        bus=bus,
+        ts=ts,
     )
     return {
         **report,

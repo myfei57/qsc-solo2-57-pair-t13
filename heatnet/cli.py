@@ -84,6 +84,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     weather = platform.push_weather(args.outdoor_c, "demo-weather")
     launch = platform.startup(args.outdoor_c, args.demand_pct, "demo-operator")
     preview = platform.plan_preview(args.demand_pct)
+    # 上一轮若把批次丢在下发中途（掉线/取消），先按日志核对现场并续作，再开新批。
+    resumed = None
+    if platform.dispatch_progress()["open"] > 0:
+        resumed = platform.resume_dispatch()
     dispatch = platform.dispatch(args.demand_pct, args.target_c, None, None)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     calibration = platform.calibrate_flow(args.baseline_t_h)
@@ -110,6 +114,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "weather": {key: weather[key] for key in ("ok", "outdoor_c", "supply_c", "epoch", "violations")},
         "launch": {key: launch[key] for key in ("ok", "stage", "flow_t_h", "supply_c", "violations")},
         "preview": preview[:3],
+        "resumed": None
+        if resumed is None
+        else {key: resumed[key] for key in ("ok", "batch_id", "epoch", "adjusted")},
         "dispatch": {
             key: dispatch[key]
             for key in ("ok", "planned", "adjusted", "target_c", "flow_t_h", "threshold_t_h", "violations")

@@ -1,15 +1,15 @@
 """换热站批量调节服务。
 
-批量调节按分区逐站下发，每处理一个站之前都要重新看一次取消信号：只在循环开始
-前看一次、或者在循环之后补一次，客户端超时取消之后剩下的站照样会被改掉，现场
-看到的是"取消之后还有几个站的阀位变了"。
+批量调节按批次日志逐站下发，每处理一个站之前都要重新看一次取消信号：只在循环
+开始前看一次、或者在循环之后补一次，客户端超时取消之后剩下的站照样会被改掉，
+现场看到的是"取消之后还有几个站的阀位变了"。单站执行与批次计数都收敛在这里，
+取消与续作的判定由 :mod:`~heatnet.station.resume` 统一负责。
 """
 
 from __future__ import annotations
 
 from ..store.state import DurableState
 from ..valve.valve import Valve
-from .mapping import StationMapping
 from .mix import apply_mix
 from .station import HeatStation
 
@@ -38,7 +38,7 @@ class CancelToken:
 
 
 class StationService:
-    """按分区批量调节换热站。"""
+    """换热站执行器：单站调节、批量计数与设备索引。"""
 
     def __init__(
         self,
@@ -87,44 +87,33 @@ class StationService:
 
         return self._aborted
 
-    def adjust_zone(
+    def note_batch(self) -> int:
+        """记一次批量调节执行（含续作）。"""
+
+        self._batches += 1
+        return self._batches
+
+    def note_aborted(self) -> int:
+        """记一次因取消而中断。"""
+
+        self._aborted += 1
+        return self._aborted
+
+    def apply_station(
         self,
-        mapping: StationMapping,
-        zone_name: str,
+        station_name: str,
         target_c: float,
-        cancel: CancelToken | None = None,
         dt: float = 1.0,
+        demand_pct: float | None = None,
     ) -> dict:
-        """调节一个分区里的全部换热站，每一步都检查取消信号。"""
+        """调节单个换热站；批次执行时按计划开度下发，缺省按当前温差现算。"""
 
         if dt <= 0:
             raise ValueError("步长必须为正")
-        members = mapping.stations_in(zone_name)
-        steps: list[dict] = []
-        adjusted: list[str] = []
-        self._batches += 1
-        for station_name in members:
-            if cancel is not None and cancel.cancelled():
-                self._aborted += 1
-                return {
-                    "ok": False,
-                    "zone": zone_name,
-                    "steps": steps,
-                    "adjusted": adjusted,
-                    "skipped": members[len(adjusted):],
-                    "violations": [f"cancelled:{cancel.reason()}"],
-                }
-            station = self.get(station_name)
-            valve = self.valve(station_name)
-            detail = apply_mix(station, valve, self._durable, target_c, dt)
-            self._durable.save(f"station/{station_name}", {"zone": zone_name, "target_c": target_c})
-            adjusted.append(station_name)
-            steps.append({"component": "station", "action": "adjust", "detail": detail})
-        return {
-            "ok": True,
-            "zone": zone_name,
-            "steps": steps,
-            "adjusted": adjusted,
-            "skipped": [],
-            "violations": [],
-        }
+        station = self.get(station_name)
+        valve = self.valve(station_name)
+        detail = apply_mix(station, valve, self._durable, target_c, dt, demand_pct=demand_pct)
+        self._durable.save(
+            f"station/{station_name}", {"zone": station.zone(), "target_c": target_c}
+        )
+        return detail

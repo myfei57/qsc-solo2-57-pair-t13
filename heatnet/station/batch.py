@@ -1,17 +1,20 @@
 """批量调节编排。
 
-先按分区优先级排出下发顺序并算出计划，再交给一次网按站独立分配流量，最后逐区
-调节。流量分配与阀门动作分两步做，是为了让"计划里的流量"与"执行后的阀位"可以
-分别核对。
+先按分区优先级排出下发顺序并算出计划，再交给一次网按站独立分配流量，最后按批次
+日志逐站下发。流量分配与阀门动作分两步做，是为了让"计划里的流量"与"执行后的阀位"
+可以分别核对；每一步动作都先落日志再执行，取消或掉线后才能按日志接着补，而不是
+整批重发一遍。
 """
 
 from __future__ import annotations
 
-from ..primary.flow import StationFlow, batch_flows
+from ..eventbus import EventBus
+from ..ns.zone import ZoneRegistry
 from ..primary.network import PrimaryNetwork
 from ..primary.order import priority_order
-from ..ns.zone import ZoneRegistry
+from .journal import BatchJournal
 from .mapping import StationMapping
+from .resume import BatchRunner
 from .service import CancelToken, StationService
 
 
@@ -44,30 +47,16 @@ def run_batch(
     target_c: float,
     cancel: CancelToken | None = None,
     dt: float = 1.0,
+    journal: BatchJournal | None = None,
+    bus: EventBus | None = None,
+    ts: float = 0.0,
 ) -> dict:
-    """算流量、下发分区、汇总结果。"""
+    """建批、按日志逐站下发、汇总结果。"""
 
+    if dt <= 0:
+        raise ValueError("步长必须为正")
+    journal = journal or BatchJournal(service.durable.store)
+    runner = BatchRunner(service, mapping, zones, network, journal, bus)
     plan = build_plan(mapping, zones, zone_names, demand_pct)
-    flows: list[StationFlow] = batch_flows(network, plan)
-    ordered = [name for name, _ in priority_order([(n, zones.get(n).setpoint_c) for n in zone_names])]
-    network.count_dispatch()
-    steps: list[dict] = [
-        {"component": "primary", "action": "allocate_flow", "detail": flow.as_dict()} for flow in flows
-    ]
-    violations: list[str] = []
-    adjusted: list[str] = []
-    for zone_name in ordered:
-        report = service.adjust_zone(mapping, zone_name, target_c, cancel, dt)
-        steps.extend(report["steps"])
-        violations.extend(report["violations"])
-        adjusted.extend(report["adjusted"])
-        if not report["ok"]:
-            break
-    return {
-        "ok": not violations,
-        "steps": steps,
-        "violations": violations,
-        "planned": len(plan),
-        "adjusted": adjusted,
-        "flows": [flow.as_dict() for flow in flows],
-    }
+    batch = runner.open_batch(plan, zone_names, demand_pct, target_c, ts=ts)
+    return runner.run(batch["batch_id"], cancel=cancel, dt=dt, ts=ts)
