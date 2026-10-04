@@ -63,6 +63,8 @@ class Api:
         add("POST", "/api/startup", self._startup)
         add("POST", "/api/shutdown", self._shutdown)
         add("POST", "/api/dispatch", self._dispatch)
+        add("POST", "/api/dispatch/resume", self._dispatch_resume)
+        add("GET", "/api/dispatch/progress", self._dispatch_progress)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/retrofit", self._retrofit)
@@ -70,6 +72,7 @@ class Api:
         add("POST", "/api/meter", self._meter)
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
+        add("POST", "/api/zone/resume-mode", self._resume_mode)
         add("POST", "/api/valve/replay", self._replay)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
@@ -275,13 +278,40 @@ class Api:
     def _dispatch(self, params: dict, body: dict) -> dict:
         zones = body.get("zones")
         selected = None if not zones else [str(item) for item in zones]
-        cancel = CancelToken(str(body.get("cancel_reason", "console-cancel"))) if body.get("cancel") else None
+        cancel = self._cancel_token(body)
         return self._platform.dispatch(
             _as_float(body, "demand_pct", 60.0),
             _as_float(body, "target_c", self._platform.config.station.setpoint_c),
             selected,
             cancel,
         )
+
+    def _dispatch_resume(self, params: dict, body: dict) -> dict:
+        # 掉线演练：请求体可携带现场实测阀位，先灌入服务再续作，核对读到的就是
+        # "现场"读数而不是内存开度。
+        readings = body.get("field_valve_pct")
+        if isinstance(readings, dict):
+            for station, value in readings.items():
+                self._platform.service.set_field_reading(str(station), float(value))
+        batch_id = body.get("batch_id")
+        cancel = self._cancel_token(body)
+        return self._platform.resume_dispatch(
+            cancel,
+            None if not batch_id else str(batch_id),
+            _as_float(body, "dt", 1.0),
+        )
+
+    def _dispatch_progress(self, params: dict, body: dict) -> dict:
+        batch_id = params.get("batch_id")
+        return self._platform.dispatch_progress(None if not batch_id else str(batch_id))
+
+    def _cancel_token(self, body: dict) -> CancelToken | None:
+        if not body.get("cancel"):
+            return None
+        kind = CancelToken.OFFLINE if body.get("offline") else CancelToken.CANCEL
+        token = CancelToken(str(body.get("cancel_reason", "console-cancel")), kind)
+        token.cancel()
+        return token
 
     def _cycle(self, params: dict, body: dict) -> dict:
         return self._platform.cycle(_as_float(body, "dt", 1.0))
@@ -312,6 +342,11 @@ class Api:
             str(body.get("source_zone", "")),
             [str(item) for item in stations],
             str(body.get("new_zone", "")),
+        )
+
+    def _resume_mode(self, params: dict, body: dict) -> dict:
+        return self._platform.configure_resume_mode(
+            str(body.get("zone", "")), str(body.get("mode", "station"))
         )
 
     def _replay(self, params: dict, body: dict) -> dict:

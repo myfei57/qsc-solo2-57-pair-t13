@@ -15,7 +15,7 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import InterlockError, PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
@@ -33,12 +33,20 @@ from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
-from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
+from .sequence import (
+    advance_heating,
+    dispatch_demand,
+    recalibrate_flow,
+    resume_demand,
+    shutdown_plant,
+    startup_plant,
+)
 from .source.adjust import Adjustment, apply_adjustment
 from .source.source import HeatSource
 from .source.weather import WeatherPush, push_weather
 from .station.batch import build_plan
 from .station.mapping import StationMapping
+from .station.progress import STATUS_OFFLINE, BatchStore
 from .station.service import CancelToken, StationService
 from .station.station import HeatStation
 from .store.command import CommandCheckpoint
@@ -57,10 +65,12 @@ DEFAULT_UNIT = "heatnet"
 DEFAULT_ZONE = "north"
 
 # 分区布置：三个供热分区各自带若干换热站，拆分演示从 north 里划出一个新分区。
-_ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
-    ("north", 62.0, ("st01", "st02", "st03")),
-    ("south", 58.0, ("st04", "st05")),
-    ("east", 54.0, ("st06",)),
+# 每个分区把续作粒度定死：north/east 按站续作（只补没改好的站），south 整区
+# 重发（没整区改好就从头再发一遍）。
+_ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...], str], ...] = (
+    ("north", 62.0, ("st01", "st02", "st03"), "station"),
+    ("south", 58.0, ("st04", "st05"), "zone"),
+    ("east", 54.0, ("st06",), "station"),
 )
 
 # 热量表按站登记，回绕阈值取配置值。
@@ -86,6 +96,7 @@ class Platform:
         self.metrics = StoreMetrics(store.root)
         self.durable = DurableState(store)
         self.checkpoint = CommandCheckpoint(store)
+        self.batch_store = BatchStore(store)
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
@@ -93,6 +104,7 @@ class Platform:
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
         self.ids = IdFactory("op")
+        self.batch_ids = IdFactory("batch")
 
         self.zones = ZoneRegistry()
         self.curve = HeatCurve(self.config.curve)
@@ -103,7 +115,7 @@ class Platform:
         self.mapping = StationMapping(self.zones)
 
         self.stations, self.valves, self.queues = self._build_stations()
-        self.service = StationService(self.stations, self.valves, self.durable)
+        self.service = StationService(self.stations, self.valves, self.durable, self.batch_store)
         self.pump: Pump = self._build_pump()
 
         self.meters = QuotaAccumulator()
@@ -122,10 +134,10 @@ class Platform:
     # ---- 装配 ---------------------------------------------------------
 
     def _build_zones(self) -> None:
-        """登记供热分区与站归属。"""
+        """登记供热分区与站归属，并把每区的续作粒度定死。"""
 
-        for name, setpoint_c, stations in _ZONE_SPECS:
-            self.zones.add(Zone(name=name, setpoint_c=setpoint_c))
+        for name, setpoint_c, stations, resume_mode in _ZONE_SPECS:
+            self.zones.add(Zone(name=name, setpoint_c=setpoint_c, resume_mode=resume_mode))
             for station in stations:
                 self.zones.assign(station, name)
 
@@ -193,6 +205,7 @@ class Platform:
             for command in self.queues[name].commands():
                 if command.seq <= applied:
                     continue
+        self._recover_interrupted_batch()
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
@@ -201,6 +214,32 @@ class Platform:
         if trips:
             reason = str(trips[-1].payload.get("reason", "unknown"))
             self.source.trip(reason)
+
+    def _recover_interrupted_batch(self) -> None:
+        """把上次进程没走完的批次标记为掉线待核对。
+
+        进度文档以 running 落盘却在重启时仍未完结，说明进程是被掉线/崩溃打断的，
+        属于部分失败：盘上的阀位记录未必等于现场真值，先转成 offline 挂起，等下
+        一次续作时逐站核对现场再发，绝不允许重启后把内存开度当现场直接补发。
+        """
+
+        active = self.service.active_progress()
+        if active is None or active.status != "running":
+            return
+        active.suspend(STATUS_OFFLINE, "process-restart")
+        self.service.save_progress(active)
+        self.bus.publish(
+            Event.of(
+                "station",
+                "station",
+                "batch_offline_detected",
+                severity="warning",
+                message=f"检测到掉线未完结批次 {active.batch_id}，续作前需核对现场",
+                batch_id=active.batch_id,
+                applied=active.applied_count(),
+                planned=len(active.steps),
+            )
+        )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -221,12 +260,13 @@ class Platform:
                 for key, value in detail.items()
                 if not isinstance(value, (dict, list))
             }
+            step_asset = str(detail.get("station", asset))
             self.bus.publish(
                 Event.of(
                     step["component"],
                     step["component"],
                     step["action"],
-                    asset=asset,
+                    asset=step_asset,
                     op_id=op_id,
                     severity="notice",
                     **flat,
@@ -398,11 +438,71 @@ class Platform:
                 demand_pct,
                 setpoint,
                 cancel,
+                batch_ids=self.batch_ids,
             )
             summary = self._record_operation(op_id, "dispatch", report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def resume_dispatch(
+        self,
+        cancel: CancelToken | None = None,
+        batch_id: str | None = None,
+        dt: float = 1.0,
+    ) -> dict:
+        """续作未完结的批量下发。
+
+        掉线批次先逐站核对现场阀位，再按各分区定死的粒度续发；取消批次直接续。
+        续作沿用原计划顺序，已改好（掉线情形下还须核对一致）的站不再下发。
+        """
+
+        with self._lock:
+            progress = (
+                self.service.load_progress(batch_id)
+                if batch_id is not None
+                else self.service.active_progress()
+            )
+            if progress is None:
+                return {"ok": True, "resumed": False, "message": "没有未完结的批量下发"}
+            if progress.is_terminal():
+                return {"ok": True, "resumed": False, "batch_id": progress.batch_id, "message": "批次已完成"}
+            op_id = self.ids.next()
+            report = resume_demand(self.service, self.network, progress, cancel, dt)
+            summary = self._record_operation(op_id, "dispatch_resume", report)
+            self._operations += 1
+            self._persist()
+            return {**report, **summary, "resumed": True}
+
+    def dispatch_progress(self, batch_id: str | None = None) -> dict:
+        """返回在途批次的续作进度，供控制台展示与审计核对。"""
+
+        progress = (
+            self.service.load_progress(batch_id)
+            if batch_id is not None
+            else self.service.active_progress()
+        )
+        if progress is None:
+            return {"active": False}
+        payload = progress.as_dict()
+        payload["active"] = not progress.is_terminal()
+        payload["zones_detail"] = [
+            {
+                "zone": zone,
+                "resume_mode": progress.zone_mode(zone),
+                "planned": len(progress.zone_steps(zone)),
+                "applied": len(
+                    [s for s in progress.zone_steps(zone) if s.station in progress.applied]
+                ),
+                "done": progress.is_zone_done(zone),
+                "verified": progress.is_zone_verified(zone),
+            }
+            for zone in progress.zones
+        ]
+        payload["actual_valve_pct"] = {
+            name: round(self.service.field_position(name), 2) for name in self.service.names()
+        }
+        return payload
 
     def calibrate_flow(self, measured_t_h: float) -> dict:
         """按实测流量重新标定一次网基线。"""
@@ -523,6 +623,29 @@ class Platform:
                 "generation": self.mapping.generation(),
                 "index": self.mapping.describe()["index"],
             }
+
+    def configure_resume_mode(self, zone_name: str, mode: str) -> dict:
+        """定死某分区的续作粒度；存在在途批次时拒绝，避免续作语义被中途改写。"""
+
+        with self._lock:
+            active = self.service.active_progress()
+            if active is not None:
+                raise InterlockError(
+                    f"有在途批次 {active.batch_id}，不得更改续作粒度", component="ns"
+                )
+            self.zones.set_resume_mode(zone_name, mode)
+            self.bus.publish(
+                Event.of(
+                    "ns",
+                    "ns",
+                    "zone_resume_mode",
+                    severity="notice",
+                    message=f"分区 {zone_name} 续作粒度定死为 {mode}",
+                    zone=zone_name,
+                    resume_mode=mode,
+                )
+            )
+            return {"ok": True, "zone": zone_name, "resume_mode": mode}
 
     def replay_valves(self, stations: list[str] | None = None) -> dict:
         """按检查点回放阀门指令队列。"""
@@ -812,6 +935,7 @@ class Platform:
             },
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "dispatch": self.dispatch_progress(),
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),

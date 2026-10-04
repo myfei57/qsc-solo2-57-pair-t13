@@ -11,9 +11,17 @@
 
 from __future__ import annotations
 
-from .dispatch import dispatch_demand, recalibrate_flow
+from .dispatch import dispatch_demand, open_demand, recalibrate_flow, resume_demand
 from .heating import advance_heating
 from .shutdown import shutdown_plant
 from .startup import startup_plant
 
-__all__ = ["advance_heating", "dispatch_demand", "recalibrate_flow", "shutdown_plant", "startup_plant"]
+__all__ = [
+    "advance_heating",
+    "dispatch_demand",
+    "open_demand",
+    "recalibrate_flow",
+    "resume_demand",
+    "shutdown_plant",
+    "startup_plant",
+]

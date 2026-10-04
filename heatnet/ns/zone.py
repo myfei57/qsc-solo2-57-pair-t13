@@ -14,6 +14,10 @@ from ..errors import NamespaceError
 SUPPLY = "supply"
 RETURN = "return"
 
+STATION = "station"
+ZONE = "zone"
+RESUME_MODES = (STATION, ZONE)
+
 
 @dataclass
 class Zone:
@@ -23,6 +27,11 @@ class Zone:
     kind: str = SUPPLY
     setpoint_c: float = 0.0
     stations: list[str] = field(default_factory=list)
+    resume_mode: str = STATION
+
+    def __post_init__(self) -> None:
+        if self.resume_mode not in RESUME_MODES:
+            raise NamespaceError(f"未知续作粒度: {self.resume_mode}", component="ns")
 
     def add_station(self, station: str) -> None:
         """把一个换热站加入本区（重复加入幂等）。"""
@@ -43,6 +52,7 @@ class Zone:
             "name": self.name,
             "kind": self.kind,
             "setpoint_c": round(self.setpoint_c, 2),
+            "resume_mode": self.resume_mode,
             "stations": list(self.stations),
         }
 
@@ -98,7 +108,12 @@ class ZoneRegistry:
         if not moving:
             raise NamespaceError("拆分必须至少包含一个属于原分区的站", component="ns")
 
-        child = Zone(name=new_name, kind=source.kind, setpoint_c=source.setpoint_c)
+        child = Zone(
+            name=new_name,
+            kind=source.kind,
+            setpoint_c=source.setpoint_c,
+            resume_mode=source.resume_mode,
+        )
         for station in moving:
             source.drop_station(station)
             child.add_station(station)
@@ -116,6 +131,14 @@ class ZoneRegistry:
                 rebuilt[station] = zone.name
         self._station_zone = rebuilt
         return len(rebuilt)
+
+    def set_resume_mode(self, zone_name: str, mode: str) -> str:
+        """把某分区的续作粒度定死（开工前后都不允许再改语义，仅在无在途批时可配）。"""
+
+        if mode not in RESUME_MODES:
+            raise NamespaceError(f"未知续作粒度: {mode}", component="ns")
+        self.get(zone_name).resume_mode = mode
+        return mode
 
     def get(self, name: str) -> Zone:
         """按名字取分区。"""

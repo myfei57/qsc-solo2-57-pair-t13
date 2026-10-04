@@ -46,6 +46,85 @@ def test_dispatch_honours_cancellation(platform):
     assert platform.service.valve("st01").moves() == 0
 
 
+class _CancelAfter(CancelToken):
+    """处理若干个站之后再置位中断。"""
+
+    def __init__(self, allowed, kind=CancelToken.CANCEL):
+        super().__init__("mid-batch", kind)
+        self._allowed = allowed
+        self._seen = 0
+
+    def cancelled(self):
+        self._seen += 1
+        return self._seen > self._allowed
+
+
+def test_cancelled_dispatch_resumes_without_recommanding(platform):
+    platform.start()
+    platform.push_weather(-8.0)
+    platform.startup(-8.0, 60.0)
+    first = platform.dispatch(60.0, 60.0, ["north"], _CancelAfter(1))
+    assert first["adjusted"] == ["st01"]
+    assert platform.status()["dispatch"]["active"] is True
+    resumed = platform.resume_dispatch()
+    assert resumed["status"] == "completed"
+    assert resumed["adjusted"] == ["st02", "st03"]
+    assert {name: platform.valves[name].moves() for name in ("st01", "st02", "st03")} == {
+        "st01": 1,
+        "st02": 1,
+        "st03": 1,
+    }
+    # 续作进度、实际阀位、审计三方一致
+    assert resumed["applied_count"] == 3
+    adjust_records = [
+        item for item in platform.audit.records(limit=200) if item.action == "adjust"
+    ]
+    by_station = {item.asset: item.payload for item in adjust_records}
+    assert set(by_station) == {"st01", "st02", "st03"}
+    # 每站一条 adjust、同一批次、全局序号按计划顺序
+    assert len(adjust_records) == 3
+    assert {payload["batch_id"] for payload in by_station.values()} == {first["batch_id"]}
+    assert [by_station[name]["seq"] for name in ("st01", "st02", "st03")] == [1, 2, 3]
+    # 审计阀位 == 进度记录 == 实际阀位
+    progress = platform.dispatch_progress(first["batch_id"])
+    for name in ("st01", "st02", "st03"):
+        recorded = progress["applied"][name]["valve_pct"]
+        actual = platform.valves[name].position_pct()
+        assert by_station[name]["valve_pct"] == round(recorded, 2)
+        assert round(actual, 2) == round(recorded, 2)
+    assert platform.status()["dispatch"]["active"] is False
+
+
+def test_offline_dispatch_requires_verification_before_resume(platform):
+    platform.start()
+    platform.push_weather(-8.0)
+    platform.startup(-8.0, 60.0)
+    platform.dispatch(60.0, 60.0, ["north"], _CancelAfter(2, kind=CancelToken.OFFLINE))
+    progress = platform.service.active_progress()
+    assert progress.status == "offline"
+    # 现场把 st02 扳偏：续作核对必须发现，且按站粒度只纠 st02
+    platform.service.set_field_reading("st02", 2.0)
+    resumed = platform.resume_dispatch()
+    assert resumed["resume"]["offline"] is True
+    assert resumed["resume"]["mismatches"] == ["st02"]
+    assert resumed["adjusted"] == ["st02", "st03"]
+    assert platform.valves["st01"].moves() == 1
+    assert platform.valves["st02"].moves() == 2
+
+
+def test_overlapping_dispatch_is_rejected_while_batch_open(platform):
+    platform.start()
+    platform.push_weather(-8.0)
+    platform.startup(-8.0, 60.0)
+    token = CancelToken("x")
+    token.cancel()
+    platform.dispatch(60.0, 60.0, ["north"], token)
+    from heatnet.errors import InterlockError
+
+    with pytest.raises(InterlockError):
+        platform.dispatch(60.0, 60.0, ["south"])
+
+
 def test_split_zone_rebuilds_mapping(platform):
     report = platform.split_zone("north", ["st02", "st03"], "north-west")
     assert report["ok"] is True

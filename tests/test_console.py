@@ -98,6 +98,54 @@ def test_api_timeline_journal_and_store(platform):
     assert isinstance(store["documents"], list)
 
 
+def test_api_resume_mode_and_dispatch_progress(platform):
+    api = Api(platform)
+    status, payload = api.handle("GET", "/api/status", {}, {})
+    assert status == 200
+    # 默认分区粒度：north 按站、south 按区
+    modes = {z["name"]: z["resume_mode"] for z in payload["zones"]["zones"]}
+    assert modes["north"] == "station"
+    assert modes["south"] == "zone"
+    # 在途为空时进度接口明确报 inactive
+    status, prog = api.handle("GET", "/api/dispatch/progress", {}, {})
+    assert status == 200 and prog["active"] is False
+    # 非法粒度被拒
+    status, bad = api.handle("POST", "/api/zone/resume-mode", {}, {"zone": "north", "mode": "bogus"})
+    assert status == 409 and bad["component"] == "ns"
+
+
+def test_api_dispatch_cancel_offline_and_resume(platform):
+    api = Api(platform)
+    platform.start()
+    platform.push_weather(-8.0)
+    platform.startup(-8.0, 60.0)
+    # 掉线中断在首站之前
+    status, dropped = api.handle(
+        "POST",
+        "/api/dispatch",
+        {},
+        {"zones": ["north"], "cancel": True, "offline": True, "cancel_reason": "link-down"},
+    )
+    assert status == 200
+    assert dropped["status"] == "offline"
+    assert dropped["violations"] == ["offline:link-down"]
+    # 进度可查、供控制台展示
+    status, prog = api.handle("GET", "/api/dispatch/progress", {}, {})
+    assert status == 200 and prog["active"] is True
+    assert prog["status"] == "offline"
+    detail = {item["zone"]: item for item in prog["zones_detail"]}
+    assert detail["north"]["resume_mode"] == "station"
+    # 掉线续作先核对再续（无现场读数 => 以内存阀位为现场，全部一致），最终完成
+    status, resumed = api.handle("POST", "/api/dispatch/resume", {}, {})
+    assert status == 200
+    assert resumed["status"] == "completed"
+    assert resumed["resume"]["offline"] is True
+    assert len(resumed["applied"]) == 3
+    # 已完成的批不再算在途
+    status, prog2 = api.handle("GET", "/api/dispatch/progress", {}, {})
+    assert status == 200 and prog2["active"] is False
+
+
 def test_api_actions_cover_queue_and_meter(platform):
     api = Api(platform)
     status, queued = api.handle("POST", "/api/dispatch", {}, {"demand_pct": 55.0, "zones": ["north"]})
